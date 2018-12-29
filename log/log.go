@@ -44,11 +44,10 @@ type Log struct {
 	Route    string
 	Status   int
 	Duration int
-	Entries  []*entry
+	Entries  []*Entry
 }
 
-type entry struct {
-	logger   *Logger
+type Entry struct {
 	EntryId  string
 	ThreadId string
 	Level    string
@@ -59,7 +58,7 @@ type entry struct {
 	KeyVals  []kv
 }
 
-func (e *entry) Data(k fmt.Stringer, v interface{}) Entry {
+func (e *Entry) Data(k fmt.Stringer, v interface{}) *Entry {
 	e.KeyVals = append(e.KeyVals, kv{k, v})
 	return e
 }
@@ -76,23 +75,23 @@ type Logger struct {
 	logs           sync.Map
 }
 
-func (l *Logger) Info(reqId string, msg string) Entry {
+func (l *Logger) Info(reqId string, msg string) *Entry {
 	return l.logEntry(levelInfo, reqId, msg)
 }
-func (l *Logger) Error(reqId string, msg string) Entry {
+func (l *Logger) Error(reqId string, msg string) *Entry {
 	return l.logEntry(levelError, reqId, msg)
 }
-func (l *Logger) Debug(reqId string, msg string) Entry {
+func (l *Logger) Debug(reqId string, msg string) *Entry {
 	return l.logEntry(levelDebug, reqId, msg)
 }
 
-func (l *Logger) InfoF(reqId string, format string, a ...interface{}) Entry {
+func (l *Logger) InfoF(reqId string, format string, a ...interface{}) *Entry {
 	return l.logEntry(levelInfo, reqId, fmt.Sprintf(format, a...))
 }
-func (l *Logger) ErrorF(reqId string, format string, a ...interface{}) Entry {
+func (l *Logger) ErrorF(reqId string, format string, a ...interface{}) *Entry {
 	return l.logEntry(levelError, reqId, fmt.Sprintf(format, a...))
 }
-func (l *Logger) DebugF(reqId string, format string, a ...interface{}) Entry {
+func (l *Logger) DebugF(reqId string, format string, a ...interface{}) *Entry {
 	return l.logEntry(levelDebug, reqId, fmt.Sprintf(format, a...))
 }
 
@@ -100,10 +99,10 @@ func (l *Logger) End(reqId, route string, status, duration int) {
 	l.end(kindRequest, reqId, route, status, duration)
 }
 
-func (l *Logger) logEntry(level logLevel, threadId, msg string) Entry {
+func (l *Logger) logEntry(level logLevel, threadId, msg string) *Entry {
 
-	if l.DisableDebug {
-		return &entry{}
+	if level == levelDebug && l.DisableDebug {
+		return &Entry{}
 	}
 
 	var file string
@@ -126,8 +125,7 @@ func (l *Logger) logEntry(level logLevel, threadId, msg string) Entry {
 	}
 
 	entryId, _ := gen.Base64(16)
-	e := &entry{
-		logger:   l,
+	e := &Entry{
 		EntryId:  entryId,
 		ThreadId: threadId,
 		Level:    level.String(),
@@ -139,12 +137,12 @@ func (l *Logger) logEntry(level logLevel, threadId, msg string) Entry {
 
 	entries, ok := l.logs.Load(threadId)
 	if !ok {
-		l.logs.Store(threadId, []*entry{e})
+		l.logs.Store(threadId, []*Entry{e})
 		return e
 	}
 
 	// We know the map only has this type as values.
-	ee := entries.([]*entry)
+	ee := entries.([]*Entry)
 	ee = append(ee, e)
 	l.logs.Store(threadId, ee)
 
@@ -153,11 +151,11 @@ func (l *Logger) logEntry(level logLevel, threadId, msg string) Entry {
 
 func (l *Logger) end(kind logKind, threadId, route string, status, duration int) {
 
-	var ee []*entry
+	var ee []*Entry
 	entries, ok := l.logs.Load(threadId)
 	if ok {
 		l.logs.Delete(threadId)
-		ee = entries.([]*entry)
+		ee = entries.([]*Entry)
 	}
 
 	// Unlike requests there's no value in logging a
@@ -182,41 +180,58 @@ func (l *Logger) end(kind logKind, threadId, route string, status, duration int)
 	})
 }
 
-type session struct {
+type Session struct {
 	logger *Logger
 	name   string
 	id     string
 }
 
-func (l *Logger) Sess(name string) Session {
+func (l *Logger) Sess(name string) *Session {
 	id, _ := gen.Base64(16)
-	return &session{
+	return &Session{
 		id:     id,
 		name:   name,
 		logger: l,
 	}
 }
 
-func (s *session) Info(msg string) Entry {
+func (s *Session) SeenError() bool {
+
+	var ee []*Entry
+	entries, ok := s.logger.logs.Load(s.id)
+	if !ok {
+		return false
+	}
+	ee = entries.([]*Entry)
+
+	for _, e := range ee {
+		if e.Level == "Error" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Session) Info(msg string) *Entry {
 	return s.logger.logEntry(levelInfo, s.id, msg)
 }
-func (s *session) Error(msg string) Entry {
+func (s *Session) Error(msg string) *Entry {
 	return s.logger.logEntry(levelError, s.id, msg)
 }
-func (s *session) Debug(msg string) Entry {
+func (s *Session) Debug(msg string) *Entry {
 	return s.logger.logEntry(levelDebug, s.id, msg)
 }
 
-func (s *session) InfoF(format string, a ...interface{}) Entry {
+func (s *Session) InfoF(format string, a ...interface{}) *Entry {
 	return s.logger.logEntry(levelInfo, s.id, fmt.Sprintf(format, a...))
 }
-func (s *session) ErrorF(format string, a ...interface{}) Entry {
+func (s *Session) ErrorF(format string, a ...interface{}) *Entry {
 	return s.logger.logEntry(levelError, s.id, fmt.Sprintf(format, a...))
 }
-func (s *session) DebugF(format string, a ...interface{}) Entry {
+func (s *Session) DebugF(format string, a ...interface{}) *Entry {
 	return s.logger.logEntry(levelDebug, s.id, fmt.Sprintf(format, a...))
 }
 
-func (s *session) End() {
+func (s *Session) End() {
 	s.logger.end(kindSession, s.id, s.name, 0, 0)
 }

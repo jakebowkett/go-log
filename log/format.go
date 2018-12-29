@@ -17,7 +17,35 @@ func pad(s string, length int) string {
 }
 
 func (log Log) FormatTerse() string {
-	return ""
+
+	var output string
+
+	if log.Kind == kindRequest {
+		duration := fmt.Sprintf("%dms", log.Duration/1000000)
+		output = fmt.Sprintf(
+			"%s %d %s %s\n",
+			log.Date.Format(time.Kitchen), log.Status, duration, log.Route)
+	}
+
+	if log.Kind == kindSession {
+		output = fmt.Sprintf(
+			"%s Session: %s\n",
+			log.Date.Format(time.Kitchen), log.Route)
+	}
+
+	for _, e := range log.Entries {
+
+		var kvs string
+		for _, kv := range e.KeyVals {
+			kvs += fmt.Sprintf("%q=%q", kv.Key, kv.Val)
+		}
+
+		output += fmt.Sprintf(
+			"[%s] %s %s\n",
+			e.Level, e.Message, kvs)
+	}
+
+	return output
 }
 
 func (log Log) FormatPretty() string {
@@ -47,7 +75,8 @@ func (log Log) FormatPretty() string {
 			fStart = "  "
 		}
 
-		file := strings.SplitAfterN(e.File, "/storydevs", 2)[1]
+		fileParts := strings.SplitAfterN(e.File, "/storydevs", 2)
+		file := fileParts[len(fileParts)-1]
 
 		// We quote strings since they might have spaces.
 		var kvs string
@@ -66,12 +95,19 @@ func (log Log) FormatPretty() string {
 			kvs += fmt.Sprintf(" │     %s = %s\n", kv.Key.String(), val)
 		}
 
+		var runtimeInfo string
+		if file != "" {
+			runtimeInfo = fmt.Sprintf(
+				" %s %s:%d (%s)\n",
+				fStart, file, e.Line, e.Function)
+		}
+
 		output += fmt.Sprintf(
 			" │\n"+
 				" %s [%s] %s\n"+
-				" %s %s:%d (%s)\n"+
+				"%s"+
 				"%s",
-			lnStart, e.Level, e.Message, fStart, file, e.Line, e.Function, kvs)
+			lnStart, e.Level, e.Message, runtimeInfo, kvs)
 	}
 
 	return output
