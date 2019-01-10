@@ -16,6 +16,10 @@ func pad(s string, length int) string {
 	return strings.Repeat("_", diff) + s
 }
 
+func (log Log) FormatRecord() string {
+	return ""
+}
+
 func (log Log) FormatTerse() string {
 
 	var output string
@@ -56,14 +60,24 @@ func (log Log) FormatPretty() string {
 		duration := fmt.Sprintf("%dms", log.Duration/1000000)
 		duration = pad(duration, 10)
 		output = fmt.Sprintf(
-			"\n%s %d %s %s\n",
-			log.Date.Format(time.Kitchen), log.Status, duration, log.Route)
+			// "\nRequest: %s, IPs: %s"+
+			"\n%s %d %s %s %s\n",
+			// log.ThreadId,
+			// log.Ip,
+			log.Date.Format(time.Kitchen),
+			log.Status,
+			duration,
+			log.Method,
+			log.Route)
 	}
 
 	if log.Kind == kindSession {
 		output = fmt.Sprintf(
+			// "\nEntry: %s"+
 			"\n%s Session: %s\n",
-			log.Date.Format(time.Kitchen), log.Route)
+			// log.ThreadId,
+			log.Date.Format(time.Kitchen),
+			log.Route)
 	}
 
 	for i, e := range log.Entries {
@@ -92,7 +106,7 @@ func (log Log) FormatPretty() string {
 				val = fmt.Sprintf("%v", kv.Val)
 			}
 
-			kvs += fmt.Sprintf(" │     %s = %s\n", kv.Key.String(), val)
+			kvs += fmt.Sprintf(" %s    %s = %s\n", fStart, kv.Key.String(), val)
 		}
 
 		var runtimeInfo string
@@ -102,12 +116,20 @@ func (log Log) FormatPretty() string {
 				fStart, file, e.Line, e.Function)
 		}
 
+		msgParts := strings.Split(e.Message, "\n")
+		for i := range msgParts {
+			if i == 0 {
+				continue
+			}
+			msgParts[i] = fmt.Sprintf(" %s    %s", fStart, msgParts[i])
+		}
+
 		output += fmt.Sprintf(
 			" │\n"+
 				" %s [%s] %s\n"+
 				"%s"+
 				"%s",
-			lnStart, e.Level, e.Message, runtimeInfo, kvs)
+			lnStart, e.Level, strings.Join(msgParts, "\n"), kvs, runtimeInfo)
 	}
 
 	return output
