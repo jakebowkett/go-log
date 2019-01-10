@@ -6,8 +6,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gofrs/uuid"
 )
 
 type logLevel struct {
@@ -19,9 +17,10 @@ func (ll logLevel) String() string {
 }
 
 var (
-	levelInfo  = logLevel{"Info"}
-	levelError = logLevel{"Error"}
-	levelDebug = logLevel{"Debug"}
+	levelStatus = logLevel{"Status"}
+	levelInfo   = logLevel{"Info"}
+	levelError  = logLevel{"Error"}
+	levelDebug  = logLevel{"Debug"}
 )
 
 type logKind struct {
@@ -41,6 +40,8 @@ type Log struct {
 	Date     time.Time
 	Kind     logKind
 	ThreadId string
+	Ip       string
+	Method   string
 	Route    string
 	Status   int
 	Duration int
@@ -67,20 +68,31 @@ type kv struct {
 	Val interface{}
 }
 
-// type id struct {
-// 	uuid uuid.UUID
-// }
-
-// func (i id) String() string {
-// 	return i.uuid.String()
-// }
-
 type Logger struct {
 	OnLogEvent     func(Log)
 	OnError        func(Log)
+	IdGenerator    func() (string, error)
 	DisableDebug   bool
 	DisableRuntime bool
 	logs           sync.Map
+	idCountMu      sync.Mutex
+	idCount        int
+}
+
+type HeaderWriter interface {
+	WriteHeader(int)
+}
+
+func (l *Logger) BadRequest(reqId string, w HeaderWriter, msg string) {
+	l.logStatus(reqId, w, 400)
+	l.logEntry(levelError, reqId, msg)
+}
+func (l *Logger) NotFound(reqId string, w HeaderWriter) {
+	l.logStatus(reqId, w, 404)
+}
+func (l *Logger) logStatus(reqId string, w HeaderWriter, code int) {
+	w.WriteHeader(code)
+	l.logs.Store(reqId+"_status", code)
 }
 
 func (l *Logger) Info(reqId, msg string) *Entry {
@@ -103,23 +115,43 @@ func (l *Logger) DebugF(reqId, format string, a ...interface{}) *Entry {
 	return l.logEntry(levelDebug, reqId, fmt.Sprintf(format, a...))
 }
 
-func (l *Logger) End(reqId, route string, status, duration int) {
-	l.end(kindRequest, reqId, route, status, duration)
+func (l *Logger) End(reqId, ip, method, route string, duration int) {
+	l.end(kindRequest, reqId, ip, method, route, duration)
 }
 
+/*
+NewId generates a new id to associate with a particular
+log thread or session thread. If a function has not been
+supplied to Logger.IdGenerator it defaults to incrementing
+numerical ids, starting from 1.
+*/
 func (l *Logger) NewId() string {
-	newId, err := uuid.NewV4()
-	if err != nil {
-		l.logUUIDError(err)
-		return newId.String()
+
+	if l.IdGenerator != nil {
+
+		id, err := l.IdGenerator()
+		if err != nil {
+			l.logIdGenError(err)
+			return l.defaultId()
+		}
+		return id
 	}
-	return newId.String()
+
+	return l.defaultId()
 }
 
-func (l *Logger) logUUIDError(err error) {
+func (l *Logger) defaultId() string {
+	l.idCountMu.Lock()
+	l.idCount++
+	id := l.idCount
+	l.idCountMu.Unlock()
+	return fmt.Sprintf("%d", id)
+}
+
+func (l *Logger) logIdGenError(err error) {
 	e := &Entry{
 		Level:   levelError.String(),
-		Message: "couldn't generate UUID for logger thread: " + err.Error(),
+		Message: "couldn't generate ID for logger thread: " + err.Error(),
 	}
 	l.insertEntry(e)
 }
@@ -186,7 +218,15 @@ func (l *Logger) insertEntry(e *Entry) {
 	l.logs.Store(e.ThreadId, ee)
 }
 
-func (l *Logger) end(kind logKind, threadId, route string, status, duration int) {
+func (l *Logger) status(reqId string) (code int) {
+	status, ok := l.logs.Load(reqId + "_status")
+	if ok {
+		return status.(int)
+	}
+	return 200
+}
+
+func (l *Logger) end(kind logKind, threadId, ip, method, route string, duration int) {
 
 	var ee []*Entry
 	entries, ok := l.logs.Load(threadId)
@@ -206,14 +246,19 @@ func (l *Logger) end(kind logKind, threadId, route string, status, duration int)
 		Date:     time.Now(),
 		ThreadId: threadId,
 		Kind:     kind,
+		Ip:       ip,
+		Method:   method,
 		Route:    route,
-		Status:   status,
 		Duration: duration,
 		Entries:  ee,
 	}
 
-	var errs []*Entry
+	if kind == kindRequest {
+		log.Status = l.status(threadId)
+	}
+
 	if l.OnError != nil {
+		var errs []*Entry
 		for _, e := range ee {
 			if e.Level == levelError.String() {
 				errs = append(errs, e)
@@ -235,6 +280,7 @@ type Session struct {
 	logger *Logger
 	name   string
 	id     string
+	ended  bool
 }
 
 func (l *Logger) Sess(name string) *Session {
@@ -263,25 +309,53 @@ func (s *Session) SeenError() bool {
 }
 
 func (s *Session) Info(msg string) *Entry {
+	if s.ended {
+		return &Entry{}
+	}
 	return s.logger.logEntry(levelInfo, s.id, msg)
 }
 func (s *Session) Error(msg string) *Entry {
+	if s.ended {
+		return &Entry{}
+	}
 	return s.logger.logEntry(levelError, s.id, msg)
 }
 func (s *Session) Debug(msg string) *Entry {
+	if s.ended {
+		return &Entry{}
+	}
 	return s.logger.logEntry(levelDebug, s.id, msg)
 }
 
 func (s *Session) InfoF(format string, a ...interface{}) *Entry {
+	if s.ended {
+		return &Entry{}
+	}
 	return s.logger.logEntry(levelInfo, s.id, fmt.Sprintf(format, a...))
 }
 func (s *Session) ErrorF(format string, a ...interface{}) *Entry {
+	if s.ended {
+		return &Entry{}
+	}
 	return s.logger.logEntry(levelError, s.id, fmt.Sprintf(format, a...))
 }
 func (s *Session) DebugF(format string, a ...interface{}) *Entry {
+	if s.ended {
+		return &Entry{}
+	}
 	return s.logger.logEntry(levelDebug, s.id, fmt.Sprintf(format, a...))
 }
 
+/*
+End calls OnError and passes it a Log containing only
+the error level logs to Session.
+
+If OnError or OnLogEvent were nil nothing will happen.
+*/
 func (s *Session) End() {
-	s.logger.end(kindSession, s.id, s.name, 0, 0)
+	if s.ended {
+		return
+	}
+	s.ended = true
+	s.logger.end(kindSession, s.id, "", "", s.name, 0)
 }
