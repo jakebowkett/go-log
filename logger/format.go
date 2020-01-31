@@ -8,36 +8,75 @@ import (
 
 const timeFormat string = "MST 2006-01-02 15:04:05"
 
-func pad(s string, length int) string {
-	diff := length - len([]rune(s))
-	if diff <= 0 {
-		return s
+type Thread struct {
+	Date     time.Time
+	Kind     threadKind
+	Id       string
+	Ip       string
+	Method   string
+	Route    string
+	Status   int
+	Duration int64
+	Entries  []*Entry
+}
+
+func (t Thread) FormatRecord() string {
+
+	msg := ""
+	for _, e := range t.Entries {
+		if e.Message != "" {
+			msg += e.Message + " "
+		}
+		if e.File != "" {
+			fileParts := strings.SplitAfterN(e.File, "/storydevs", 2)
+			file := fileParts[len(fileParts)-1]
+			msg += fmt.Sprintf("%s:%d (%s)", file, e.Line, e.Function)
+		}
+		msg += "\n"
 	}
-	return strings.Repeat("_", diff) + s
+	msg = strings.TrimSuffix(msg, "\n")
+
+	s := ""
+	switch t.Kind {
+	case kindRequest:
+		s = fmt.Sprintf(
+			"%d %d %dms %s %s %s\n",
+			t.Date.UnixNano(),
+			t.Status,
+			t.Duration/1000000,
+			t.Method,
+			t.Route,
+			msg,
+		)
+	case kindSession:
+		s = fmt.Sprintf(
+			"%d %s\n",
+			t.Date.UnixNano(),
+			msg,
+		)
+	}
+
+	return s
 }
 
-func (log Log) FormatRecord() string {
-	return ""
-}
-
-func (log Log) FormatTerse() string {
+func (thread Thread) FormatTerse() string {
 
 	var output string
 
-	if log.Kind == kindRequest {
-		duration := fmt.Sprintf("%dms", log.Duration/1000000)
+	if thread.Kind == kindRequest {
+		duration := fmt.Sprintf("%dms", thread.Duration/1000000)
 		output = fmt.Sprintf(
 			"%s %d %s %s\n",
-			log.Date.Format(time.Kitchen), log.Status, duration, log.Route)
+			thread.Date.Format(time.Kitchen), thread.Status, duration, thread.Route)
 	}
 
-	if log.Kind == kindSession {
+	if thread.Kind == kindSession {
 		output = fmt.Sprintf(
 			"%s Session: %s\n",
-			log.Date.Format(time.Kitchen), log.Route)
+			thread.Date.Format(time.Kitchen), thread.Route)
 	}
 
-	for _, e := range log.Entries {
+	for _, e := range thread.Entries {
 
 		var kvs string
 		for _, kv := range e.KeyVals {
@@ -52,39 +91,51 @@ func (log Log) FormatTerse() string {
 	return output
 }
 
-func (log Log) FormatPretty() string {
+func (thread Thread) FormatPretty() string {
 
 	var output string
 
-	if log.Kind == kindRequest {
-		duration := fmt.Sprintf("%dms", log.Duration/1000000)
+	if thread.Kind == kindRequest {
+
+		duration := fmt.Sprintf("%dms", thread.Duration/1000000)
 		duration = pad(duration, 10)
+
+		lastColon := strings.LastIndex(thread.Ip, ":")
+		if lastColon == -1 {
+			lastColon = 0
+		}
+		ip := thread.Ip[0:lastColon]
+
 		output = fmt.Sprintf(
 			// "\nRequest: %s, IPs: %s"+
-			"\n%s %d %s %s %s\n",
-			// log.ThreadId,
-			// log.Ip,
-			log.Date.Format(time.Kitchen),
-			log.Status,
+			"\n%s %d %s %s %s %s\n",
+			// thread.Id,
+			thread.Date.Format(time.Kitchen),
+			thread.Status,
+			pad(ip, 20),
 			duration,
-			log.Method,
-			log.Route)
+			thread.Method,
+			thread.Route)
 	}
 
-	if log.Kind == kindSession {
-		output = fmt.Sprintf(
-			// "\nEntry: %s"+
-			"\n%s Session: %s\n",
-			// log.ThreadId,
-			log.Date.Format(time.Kitchen),
-			log.Route)
+	if thread.Kind == kindSession {
+		if thread.Route == "" {
+			output = "\n" + thread.Date.Format(time.Kitchen) + "\n"
+		} else {
+			output = fmt.Sprintf(
+				// "\nEntry: %s"+
+				"\n%s Session: %s\n",
+				// thread.Id,
+				thread.Date.Format(time.Kitchen),
+				thread.Route)
+		}
 	}
 
-	for i, e := range log.Entries {
+	for i, e := range thread.Entries {
 
 		lnStart := "├─"
 		fStart := "│ "
-		if i == len(log.Entries)-1 {
+		if i == len(thread.Entries)-1 {
 			lnStart = "└─"
 			fStart = "  "
 		}
@@ -99,14 +150,14 @@ func (log Log) FormatPretty() string {
 			var val string
 			switch kv.Val.(type) {
 			case error:
-				val = fmt.Sprintf("%s", kv.Val.(error).Error())
+				val = fmt.Sprintf("\"%v\"", kv.Val.(error).Error())
 			case string:
-				val = fmt.Sprintf("%s", kv.Val)
+				val = fmt.Sprintf("\"%v\"", kv.Val)
 			default:
 				val = fmt.Sprintf("%v", kv.Val)
 			}
 
-			kvs += fmt.Sprintf(" %s    %s = %s\n", fStart, kv.Key.String(), val)
+			kvs += fmt.Sprintf(" %s    %s = %s\n", fStart, kv.Key, val)
 		}
 
 		var runtimeInfo string
@@ -133,4 +184,12 @@ func (log Log) FormatPretty() string {
 	}
 
 	return output
+}
+
+func pad(s string, length int) string {
+	diff := length - len([]rune(s))
+	if diff <= 0 {
+		return s
+	}
+	return strings.Repeat("_", diff) + s
 }
