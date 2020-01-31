@@ -2,10 +2,21 @@ package logger
 
 import (
 	"fmt"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	levelInfo  = logLevel{"Info"}
+	levelError = logLevel{"Error"}
+	levelDebug = logLevel{"Debug"}
+
+	kindRequest = threadKind{"request"}
+	kindSession = threadKind{"session"}
 )
 
 type logLevel struct {
@@ -16,36 +27,21 @@ func (ll logLevel) String() string {
 	return ll.name
 }
 
-var (
-	levelStatus = logLevel{"Status"}
-	levelInfo   = logLevel{"Info"}
-	levelError  = logLevel{"Error"}
-	levelDebug  = logLevel{"Debug"}
-)
-
-type logKind struct {
+type threadKind struct {
 	name string
 }
 
-func (lk logKind) String() string {
-	return lk.name
+func (tk threadKind) String() string {
+	return tk.name
 }
 
-var (
-	kindRequest = logKind{"request"}
-	kindSession = logKind{"session"}
-)
+type HeaderWriter interface {
+	WriteHeader(int)
+}
 
-type Log struct {
-	Date     time.Time
-	Kind     logKind
-	ThreadId string
-	Ip       string
-	Method   string
-	Route    string
-	Status   int
-	Duration int
-	Entries  []*Entry
+type kv struct {
+	Key string
+	Val interface{}
 }
 
 type Entry struct {
@@ -58,34 +54,73 @@ type Entry struct {
 	KeyVals  []kv
 }
 
-func (e *Entry) Data(k fmt.Stringer, v interface{}) *Entry {
+func (e *Entry) Data(k string, v interface{}) *Entry {
 	e.KeyVals = append(e.KeyVals, kv{k, v})
 	return e
 }
 
-type kv struct {
-	Key fmt.Stringer
-	Val interface{}
+func (e *Entry) DataMulti(kvs KeyValuer) *Entry {
+	for k, v, done := kvs.Next(); !done; {
+		e.KeyVals = append(e.KeyVals, kv{k, v})
+	}
+	return e
+}
+
+type KeyValuer interface {
+	Next() (key string, val interface{}, done bool)
 }
 
 type Logger struct {
-	OnLogEvent     func(Log)
-	OnError        func(Log)
-	IdGenerator    func() (string, error)
-	DisableDebug   bool
-	DisableRuntime bool
-	logs           sync.Map
-	idCountMu      sync.Mutex
-	idCount        int
+	OnLog     func(Thread)
+	OnError   func(Thread)
+	idCount   int64
+	debug     bool
+	runtime   bool
+	idCountMu sync.Mutex
+	debugMu   sync.Mutex
+	runtimeMu sync.Mutex
+	logs      sync.Map
 }
 
-type HeaderWriter interface {
-	WriteHeader(int)
+func (l *Logger) SetDebug(enabled bool) {
+	l.debugMu.Lock()
+	l.debug = enabled
+	l.debugMu.Unlock()
+}
+func (l *Logger) SetRuntime(enabled bool) {
+	l.runtimeMu.Lock()
+	l.runtime = enabled
+	l.runtimeMu.Unlock()
 }
 
-func (l *Logger) BadRequest(reqId string, w HeaderWriter, msg string) {
+/*
+NewId generates a new id to associate with a particular
+log thread or session thread. It increments numerical
+ids, starting from 1.
+*/
+
+func (l *Logger) NewId() string {
+	l.idCountMu.Lock()
+
+	// We defer to avoid idCount changing between
+	// incrementing it and converting it to a string.
+	defer l.idCountMu.Unlock()
+	l.idCount++
+	return strconv.FormatInt(l.idCount, 10)
+}
+
+func (l *Logger) HttpStatus(reqId string, w HeaderWriter, code int) {
+	l.logStatus(reqId, w, code)
+}
+func (l *Logger) Redirect(reqId string, code int) {
+	l.logs.Store(reqId+"_status", code)
+}
+func (l *Logger) BadRequest(reqId string, w HeaderWriter, msg string) *Entry {
 	l.logStatus(reqId, w, 400)
-	l.logEntry(levelError, reqId, msg)
+	return l.logEntry(levelError, reqId, msg)
+}
+func (l *Logger) Unauthorised(reqId string, w HeaderWriter) {
+	l.logStatus(reqId, w, 401)
 }
 func (l *Logger) NotFound(reqId string, w HeaderWriter) {
 	l.logStatus(reqId, w, 404)
@@ -93,6 +128,43 @@ func (l *Logger) NotFound(reqId string, w HeaderWriter) {
 func (l *Logger) logStatus(reqId string, w HeaderWriter, code int) {
 	w.WriteHeader(code)
 	l.logs.Store(reqId+"_status", code)
+}
+
+func (l *Logger) ErrorMulti(reqId, msg, key string, errs []error) *Entry {
+
+	m := map[string]int{}
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		m[err.Error()]++
+	}
+
+	e := l.logEntry(levelError, reqId, msg)
+
+	for es, i := range m {
+		e.Data(key, fmt.Sprintf("(%d instances) %s", i, es))
+	}
+
+	return e
+}
+
+func (l *Logger) Fatal(err error) {
+	id := l.NewId()
+	l.logEntry(levelError, id, err.Error())
+	l.end(kindSession, id, "", "", "", 0)
+	os.Exit(1)
+}
+
+func (l *Logger) Once(msg string) {
+	id := l.NewId()
+	l.logEntry(levelInfo, id, msg)
+	l.end(kindSession, id, "", "", "", 0)
+}
+func (l *Logger) OnceF(format string, a ...interface{}) {
+	id := l.NewId()
+	l.logEntry(levelInfo, id, fmt.Sprintf(format, a...))
+	l.end(kindSession, id, "", "", "", 0)
 }
 
 func (l *Logger) Info(reqId, msg string) *Entry {
@@ -115,88 +187,36 @@ func (l *Logger) DebugF(reqId, format string, a ...interface{}) *Entry {
 	return l.logEntry(levelDebug, reqId, fmt.Sprintf(format, a...))
 }
 
-func (l *Logger) End(reqId, ip, method, route string, duration int) {
+func (l *Logger) End(reqId, ip, method, route string, duration int64) {
 	l.end(kindRequest, reqId, ip, method, route, duration)
-}
-
-/*
-NewId generates a new id to associate with a particular
-log thread or session thread. If a function has not been
-supplied to Logger.IdGenerator it defaults to incrementing
-numerical ids, starting from 1.
-*/
-func (l *Logger) NewId() string {
-
-	if l.IdGenerator != nil {
-
-		id, err := l.IdGenerator()
-		if err != nil {
-			l.logIdGenError(err)
-			return l.defaultId()
-		}
-		return id
-	}
-
-	return l.defaultId()
-}
-
-func (l *Logger) defaultId() string {
-	l.idCountMu.Lock()
-	l.idCount++
-	id := l.idCount
-	l.idCountMu.Unlock()
-	return fmt.Sprintf("%d", id)
-}
-
-func (l *Logger) logIdGenError(err error) {
-	e := &Entry{
-		Level:   levelError.String(),
-		Message: "couldn't generate ID for logger thread: " + err.Error(),
-	}
-	l.insertEntry(e)
-}
-
-func (l *Logger) getCallSite() (string, string, int) {
-
-	var file string
-	var function string
-	var line int
-
-	if l.DisableRuntime {
-		return function, file, line
-	}
-
-	pc, fn, ln, ok := runtime.Caller(3)
-	if !ok {
-		file = "Unable to obtain call site."
-		function = "Unknown"
-	} else {
-		function = runtime.FuncForPC(pc).Name()
-		if idx := strings.LastIndex(function, "/"); idx != -1 {
-			function = function[idx+1 : len(function)]
-		}
-		file = fn
-	}
-	line = ln
-
-	return function, file, line
 }
 
 func (l *Logger) logEntry(level logLevel, threadId, msg string) *Entry {
 
-	if level == levelDebug && l.DisableDebug {
-		return &Entry{}
+	// Capitalise msg and add a period at the end.
+	if !strings.HasSuffix(msg, ".") {
+		msg += "."
+	}
+	for _, r := range msg {
+		msg = strings.ToUpper(string(r)) + msg[len(string(r)):]
+		break
 	}
 
-	function, file, line := l.getCallSite()
+	if level == levelDebug && !l.debug {
+		return &Entry{}
+	}
 
 	e := &Entry{
 		ThreadId: threadId,
 		Level:    level.String(),
-		Function: function,
-		File:     file,
-		Line:     line,
 		Message:  msg,
+	}
+
+	if l.runtime {
+		function, file, line := callSite()
+		e.Function = function
+		e.File = file
+		e.Line = line
 	}
 
 	l.insertEntry(e)
@@ -218,15 +238,7 @@ func (l *Logger) insertEntry(e *Entry) {
 	l.logs.Store(e.ThreadId, ee)
 }
 
-func (l *Logger) status(reqId string) (code int) {
-	status, ok := l.logs.Load(reqId + "_status")
-	if ok {
-		return status.(int)
-	}
-	return 200
-}
-
-func (l *Logger) end(kind logKind, threadId, ip, method, route string, duration int) {
+func (l *Logger) end(kind threadKind, threadId, ip, method, route string, duration int64) {
 
 	var ee []*Entry
 	entries, ok := l.logs.Load(threadId)
@@ -242,9 +254,9 @@ func (l *Logger) end(kind logKind, threadId, ip, method, route string, duration 
 		return
 	}
 
-	log := Log{
+	log := Thread{
 		Date:     time.Now(),
-		ThreadId: threadId,
+		Id:       threadId,
 		Kind:     kind,
 		Ip:       ip,
 		Method:   method,
@@ -270,92 +282,31 @@ func (l *Logger) end(kind logKind, threadId, ip, method, route string, duration 
 		}
 	}
 
-	if l.OnLogEvent == nil {
+	if l.OnLog == nil {
 		return
 	}
-	l.OnLogEvent(log)
+	l.OnLog(log)
 }
 
-type Session struct {
-	logger *Logger
-	name   string
-	id     string
-	ended  bool
-}
-
-func (l *Logger) Sess(name string) *Session {
-	return &Session{
-		id:     l.NewId(),
-		name:   name,
-		logger: l,
+func (l *Logger) status(reqId string) (code int) {
+	status, ok := l.logs.Load(reqId + "_status")
+	if ok {
+		return status.(int)
 	}
+	return 200
 }
 
-func (s *Session) SeenError() bool {
+func callSite() (string, string, int) {
 
-	var ee []*Entry
-	entries, ok := s.logger.logs.Load(s.id)
+	pc, fn, ln, ok := runtime.Caller(3)
 	if !ok {
-		return false
+		return "Unknown", "Unable to obtain call site", 0
 	}
-	ee = entries.([]*Entry)
 
-	for _, e := range ee {
-		if e.Level == "Error" {
-			return true
-		}
+	function := runtime.FuncForPC(pc).Name()
+	if idx := strings.LastIndex(function, "/"); idx != -1 {
+		function = function[idx+1 : len(function)]
 	}
-	return false
-}
 
-func (s *Session) Info(msg string) *Entry {
-	if s.ended {
-		return &Entry{}
-	}
-	return s.logger.logEntry(levelInfo, s.id, msg)
-}
-func (s *Session) Error(msg string) *Entry {
-	if s.ended {
-		return &Entry{}
-	}
-	return s.logger.logEntry(levelError, s.id, msg)
-}
-func (s *Session) Debug(msg string) *Entry {
-	if s.ended {
-		return &Entry{}
-	}
-	return s.logger.logEntry(levelDebug, s.id, msg)
-}
-
-func (s *Session) InfoF(format string, a ...interface{}) *Entry {
-	if s.ended {
-		return &Entry{}
-	}
-	return s.logger.logEntry(levelInfo, s.id, fmt.Sprintf(format, a...))
-}
-func (s *Session) ErrorF(format string, a ...interface{}) *Entry {
-	if s.ended {
-		return &Entry{}
-	}
-	return s.logger.logEntry(levelError, s.id, fmt.Sprintf(format, a...))
-}
-func (s *Session) DebugF(format string, a ...interface{}) *Entry {
-	if s.ended {
-		return &Entry{}
-	}
-	return s.logger.logEntry(levelDebug, s.id, fmt.Sprintf(format, a...))
-}
-
-/*
-End calls OnError and passes it a Log containing only
-the error level logs to Session.
-
-If OnError or OnLogEvent were nil nothing will happen.
-*/
-func (s *Session) End() {
-	if s.ended {
-		return
-	}
-	s.ended = true
-	s.logger.end(kindSession, s.id, "", "", s.name, 0)
+	return function, fn, ln
 }
